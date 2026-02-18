@@ -1,7 +1,7 @@
 import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha512";
 import { execSync } from "child_process";
-import { randomBytes } from "crypto";
+import { randomBytes, createPrivateKey } from "crypto";
 import { tmpdir } from "os";
 import { writeFileSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
@@ -98,23 +98,62 @@ export function ageEncrypt(plaintext: string, recipientAgeKey: string): string {
 }
 
 /**
+ * Convert an Ed25519 seed (32 bytes) to an SSH PEM private key.
+ * This allows `age -d -i <pem-file>` to decrypt messages encrypted
+ * to the corresponding SSH ed25519 public key.
+ */
+export function ed25519SeedToSshPem(seed: Buffer | Uint8Array): string {
+  // PKCS8 DER prefix for Ed25519 private keys
+  const pkcs8Prefix = Buffer.from("302e020100300506032b657004220420", "hex");
+  const derKey = Buffer.concat([pkcs8Prefix, Buffer.from(seed)]);
+
+  const keyObj = createPrivateKey({
+    key: derKey,
+    format: "der",
+    type: "pkcs8",
+  });
+
+  return keyObj.export({ type: "pkcs8", format: "pem" }) as string;
+}
+
+/**
  * Decrypt age-encrypted ciphertext.
  * Takes base64-encoded ciphertext and an age secret key.
+ * Optionally accepts an ed25519 seed to also try SSH key decryption
+ * (for messages encrypted via ageEncryptToSshKey).
  */
-export function ageDecrypt(ciphertextBase64: string, ageSecretKey: string): string {
+export function ageDecrypt(ciphertextBase64: string, ageSecretKey: string, ed25519Seed?: Buffer | Uint8Array): string {
   const tmpIn = join(tmpdir(), `fc-dec-${randomBytes(8).toString("hex")}.age`);
   const tmpKey = join(tmpdir(), `fc-key-${randomBytes(8).toString("hex")}`);
+  const tmpSshKey = join(tmpdir(), `fc-ssh-${randomBytes(8).toString("hex")}.pem`);
+  let hasSshKey = false;
 
   try {
     writeFileSync(tmpIn, Buffer.from(ciphertextBase64, "base64"));
     writeFileSync(tmpKey, ageSecretKey + "\n", { mode: 0o600 });
-    const result = execSync(`age -d -i "${tmpKey}" "${tmpIn}"`, {
+
+    let cmd = `age -d -i "${tmpKey}"`;
+
+    // If ed25519 seed is provided, also write SSH PEM key for SSH-recipient decryption
+    if (ed25519Seed && ed25519Seed.length === 32) {
+      const pem = ed25519SeedToSshPem(ed25519Seed);
+      writeFileSync(tmpSshKey, pem, { mode: 0o600 });
+      hasSshKey = true;
+      cmd += ` -i "${tmpSshKey}"`;
+    }
+
+    cmd += ` "${tmpIn}"`;
+
+    const result = execSync(cmd, {
       stdio: ["pipe", "pipe", "pipe"],
     });
     return result.toString("utf-8");
   } finally {
     try { unlinkSync(tmpIn); } catch {}
     try { unlinkSync(tmpKey); } catch {}
+    if (hasSshKey) {
+      try { unlinkSync(tmpSshKey); } catch {}
+    }
   }
 }
 

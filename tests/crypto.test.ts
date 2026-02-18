@@ -9,6 +9,9 @@ import {
   buildSignInput,
   ageEncrypt,
   ageDecrypt,
+  ageEncryptToSshKey,
+  ed25519ToSshPubkey,
+  ed25519SeedToSshPem,
   generateNonce,
 } from "../src/crypto.js";
 import * as ed from "@noble/ed25519";
@@ -136,6 +139,71 @@ describe("Crypto", () => {
       const encrypted = ageEncrypt(payload, identity.agePublicKey);
       const decrypted = ageDecrypt(encrypted, identity.agePrivateKey);
       expect(JSON.parse(decrypted)).toEqual(JSON.parse(payload));
+    });
+  });
+
+  describe("SSH key decrypt (ageEncryptToSshKey path)", () => {
+    it("should decrypt messages encrypted to SSH ed25519 public key", () => {
+      const identity = getOrCreateIdentity();
+      const plaintext = "Hello via SSH key encryption!";
+
+      // Encrypt to the SSH ed25519 public key (the v2.1 ageEncryptToSshKey path)
+      const sshPubkey = ed25519ToSshPubkey(identity.publicKey.toString("base64"));
+      const encrypted = ageEncryptToSshKey(plaintext, sshPubkey);
+
+      expect(typeof encrypted).toBe("string");
+      expect(encrypted.length).toBeGreaterThan(0);
+
+      // Decrypt with both age key and ed25519 seed — this is the bug fix
+      const decrypted = ageDecrypt(encrypted, identity.agePrivateKey, identity.privateKey);
+      expect(decrypted).toBe(plaintext);
+    });
+
+    it("should decrypt SSH-encrypted JSON payloads", () => {
+      const identity = getOrCreateIdentity();
+      const payload = JSON.stringify({
+        type: "text",
+        content: "Message from a fleet using SSH key path",
+        metadata: { sender: "joseph-fleet" },
+      });
+
+      const sshPubkey = ed25519ToSshPubkey(identity.publicKey.toString("base64"));
+      const encrypted = ageEncryptToSshKey(payload, sshPubkey);
+      const decrypted = ageDecrypt(encrypted, identity.agePrivateKey, identity.privateKey);
+      expect(JSON.parse(decrypted)).toEqual(JSON.parse(payload));
+    });
+
+    it("should still decrypt age-key-encrypted messages when ed25519 seed is provided", () => {
+      const identity = getOrCreateIdentity();
+      const plaintext = "Normal age-key encrypted message";
+
+      // Encrypt to age public key (normal path)
+      const encrypted = ageEncrypt(plaintext, identity.agePublicKey);
+
+      // Decrypt with both keys — should still work for age-encrypted messages
+      const decrypted = ageDecrypt(encrypted, identity.agePrivateKey, identity.privateKey);
+      expect(decrypted).toBe(plaintext);
+    });
+
+    it("should convert ed25519 seed to valid SSH PEM", () => {
+      const seed = randomBytes(32);
+      const pem = ed25519SeedToSshPem(seed);
+
+      expect(pem).toContain("-----BEGIN PRIVATE KEY-----");
+      expect(pem).toContain("-----END PRIVATE KEY-----");
+    });
+
+    it("should fail decrypt without ed25519 seed for SSH-encrypted messages", () => {
+      const identity = getOrCreateIdentity();
+      const plaintext = "This will fail without SSH key";
+
+      const sshPubkey = ed25519ToSshPubkey(identity.publicKey.toString("base64"));
+      const encrypted = ageEncryptToSshKey(plaintext, sshPubkey);
+
+      // Try decrypt with only age key — should fail (this is the original bug)
+      expect(() => {
+        ageDecrypt(encrypted, identity.agePrivateKey);
+      }).toThrow();
     });
   });
 

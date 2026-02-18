@@ -209,7 +209,7 @@ export function receiveMessage(envelope: MessageEnvelope): {
   // Trusted → decrypt and store
   if (trustLevel === TrustLevel.TRUSTED) {
     try {
-      const decrypted = ageDecrypt(envelope.payload, identity.agePrivateKey);
+      const decrypted = ageDecrypt(envelope.payload, identity.agePrivateKey, identity.privateKey);
       const payload: MessagePayload = JSON.parse(decrypted);
 
       // Store message
