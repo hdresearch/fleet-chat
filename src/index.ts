@@ -2,16 +2,24 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { streamSSE } from "hono/streaming";
 import { getDb, closeDb } from "./store.js";
-import { getOrCreateIdentity, getIdentity, getPublicKeyBase64 } from "./identity.js";
+import { getOrCreateIdentity, getIdentity, getPublicKeyBase64, getOwnAttestations } from "./identity.js";
 import { sendMessage, receiveMessage, listMessages, purgeOldNonces } from "./messages.js";
 import {
   addContact,
   listContacts,
   getContactByPubkey,
+  getContactIdByPubkey,
   setTrustLevel,
   deleteContact,
   generateAddLinkToken,
   consumeAddLinkToken,
+  getContactKeys,
+  addContactKey,
+  removeContactKey,
+  getAttestations,
+  addAttestation,
+  verifyAttestation,
+  removeAttestation,
 } from "./contacts.js";
 import {
   listQuarantine,
@@ -64,7 +72,7 @@ app.use("*", requireAuth);
 
 // ─── Health ───
 app.get("/health", (c) => {
-  return c.json({ status: "ok", version: "2.0.0" });
+  return c.json({ status: "ok", version: "2.1.0" });
 });
 
 // ─── Identity ───
@@ -72,13 +80,24 @@ app.get("/identity", (c) => {
   const identity = getIdentity();
   if (!identity) return c.json({ error: "Identity not initialized" }, 500);
 
+  const attestations = getOwnAttestations();
+
   return c.json({
+    // v2.1 format: keys array + attestations
+    display_name: identity.displayName,
+    endpoint: identity.endpoint,
+    keys: [
+      {
+        public_key: identity.publicKey.toString("base64"),
+        key_type: "ed25519",
+      },
+    ],
+    attestations,
+    // Keep legacy fields for backward compatibility
     public_key: identity.publicKey.toString("base64"),
     age_public_key: identity.agePublicKey,
-    endpoint: identity.endpoint,
-    display_name: identity.displayName,
-    version: "2.0.0",
-    capabilities: ["text", "endpoint_migration", "key_exchange", "ping", "ack"],
+    version: "2.1.0",
+    capabilities: ["text", "attestations", "endpoint_migration", "key_exchange", "ping", "ack"],
   });
 });
 
@@ -195,11 +214,30 @@ app.get("/contacts", (c) => {
   });
 
   return c.json({
-    contacts: contacts.map((ct) => ({
-      ...ct,
-      trust_level: TrustLevelName[ct.trust_level] || "unknown",
-      display_name: ct.display_name || truncateKey(ct.public_key),
-    })),
+    contacts: contacts.map((ct) => {
+      const keys = getContactKeys(ct.id);
+      const attestationList = getAttestations(ct.id);
+      return {
+        ...ct,
+        trust_level: TrustLevelName[ct.trust_level] || "unknown",
+        display_name: ct.display_name || truncateKey(ct.public_key || "unknown"),
+        keys: keys.map((k) => ({
+          id: k.id,
+          public_key: k.public_key,
+          key_type: k.key_type,
+          age_public_key: k.age_public_key,
+          added_at: k.added_at,
+          last_used: k.last_used,
+        })),
+        attestations: attestationList.map((a) => ({
+          id: a.id,
+          url: a.url,
+          status: a.status,
+          verified_at: a.verified_at,
+          verified_by: a.verified_by,
+        })),
+      };
+    }),
     count: contacts.length,
   });
 });
@@ -218,10 +256,13 @@ app.post("/contacts/add", async (c) => {
       trustLevel: body.trust_level,
       agePublicKey: body.age_public_key,
       notes: body.notes,
+      attestations: body.attestations,
     });
     return c.json({
       ...contact,
       trust_level: TrustLevelName[contact.trust_level] || "unknown",
+      keys: getContactKeys(contact.id),
+      attestations: getAttestations(contact.id),
     }, 201);
   } catch (e: any) {
     return c.json({ error: e.message }, 400);
@@ -306,11 +347,14 @@ app.get("/contacts/add-link", (c) => {
     consumeAddLinkToken(token, visitorPubkey);
   }
 
+  const attestations = getOwnAttestations();
+
   return c.json({
     public_key: identity.publicKey.toString("base64"),
     endpoint: identity.endpoint,
     display_name: identity.displayName,
     age_public_key: identity.agePublicKey,
+    attestations,
     // Tell the visitor to POST back their identity for mutual exchange
     exchange_url: `${identity.endpoint}/contacts/add-link`,
   });
@@ -342,16 +386,23 @@ app.post("/contacts/add-link", async (c) => {
       displayName: body.display_name || undefined,
       trustLevel: "pending",
       agePublicKey: body.age_public_key || undefined,
+      attestations: body.attestations,
     });
   } catch {
     // Already exists — update their info if we have better data
-    const { updateContactInfo } = await import("./contacts.js");
+    const { updateContactInfo, syncAttestationsFromEnvelope, getContactIdByPubkey: getIdByPk } = await import("./contacts.js");
     updateContactInfo(body.public_key, {
       displayName: body.display_name,
       endpoint: body.endpoint,
       agePublicKey: body.age_public_key,
     });
+    if (body.attestations?.length) {
+      const cid = getIdByPk(body.public_key);
+      if (cid) syncAttestationsFromEnvelope(cid, body.attestations);
+    }
   }
+
+  const attestations = getOwnAttestations();
 
   // Return our full identity so both sides have complete records
   return c.json({
@@ -359,8 +410,83 @@ app.post("/contacts/add-link", async (c) => {
     endpoint: identity.endpoint,
     display_name: identity.displayName,
     age_public_key: identity.agePublicKey,
+    attestations,
     added: true,
   });
+});
+
+// ─── Contact keys ───
+app.get("/contacts/:contactId/keys", (c) => {
+  const contactId = c.req.param("contactId");
+  const keys = getContactKeys(contactId);
+  return c.json({ keys, count: keys.length });
+});
+
+app.post("/contacts/:contactId/keys", async (c) => {
+  const contactId = c.req.param("contactId");
+  const body = await c.req.json();
+  if (!body.public_key) return c.json({ error: "public_key required" }, 400);
+
+  try {
+    const key = addContactKey(contactId, {
+      publicKey: body.public_key,
+      keyType: body.key_type,
+      agePublicKey: body.age_public_key,
+    });
+    return c.json(key, 201);
+  } catch (e: any) {
+    return c.json({ error: e.message }, 400);
+  }
+});
+
+app.delete("/contacts/keys/:keyId", (c) => {
+  const keyId = c.req.param("keyId");
+  const deleted = removeContactKey(keyId);
+  return deleted ? c.json({ deleted: true }) : c.json({ error: "Not found" }, 404);
+});
+
+// ─── Attestations ───
+app.get("/contacts/:contactId/attestations", (c) => {
+  const contactId = c.req.param("contactId");
+  const attestations = getAttestations(contactId);
+  return c.json({ attestations, count: attestations.length });
+});
+
+app.post("/contacts/:contactId/attestations", async (c) => {
+  const contactId = c.req.param("contactId");
+  const body = await c.req.json();
+  if (!body.url) return c.json({ error: "url required" }, 400);
+
+  try {
+    const attestation = addAttestation(contactId, body.url, { notes: body.notes });
+    return c.json(attestation, 201);
+  } catch (e: any) {
+    return c.json({ error: e.message }, 400);
+  }
+});
+
+app.post("/contacts/attestations/:attestationId/verify", async (c) => {
+  const attestationId = c.req.param("attestationId");
+  const body = await c.req.json();
+  if (!body.status || !["verified", "rejected"].includes(body.status)) {
+    return c.json({ error: "status must be 'verified' or 'rejected'" }, 400);
+  }
+
+  const result = verifyAttestation(attestationId, {
+    status: body.status,
+    verifiedBy: body.verified_by || "api",
+    notes: body.notes,
+  });
+
+  return result
+    ? c.json(result)
+    : c.json({ error: "Not found" }, 404);
+});
+
+app.delete("/contacts/attestations/:attestationId", (c) => {
+  const attestationId = c.req.param("attestationId");
+  const deleted = removeAttestation(attestationId);
+  return deleted ? c.json({ deleted: true }) : c.json({ error: "Not found" }, 404);
 });
 
 // ─── Quarantine ───
@@ -372,15 +498,23 @@ app.get("/quarantine", (c) => {
   });
 
   return c.json({
-    items: result.items.map((item) => ({
-      id: item.id,
-      message_id: item.message_id,
-      from_key: item.from_key,
-      from_name: resolveDisplayName(item.from_key),
-      received_at: item.received_at,
-      type: item.type,
-      status: item.status,
-    })),
+    items: result.items.map((item) => {
+      const contactId = getContactIdByPubkey(item.from_key);
+      const attestationList = contactId ? getAttestations(contactId) : [];
+      return {
+        id: item.id,
+        message_id: item.message_id,
+        from_key: item.from_key,
+        from_name: resolveDisplayName(item.from_key),
+        attestations: attestationList.map((a) => ({
+          url: a.url,
+          status: a.status,
+        })),
+        received_at: item.received_at,
+        type: item.type,
+        status: item.status,
+      };
+    }),
     count: result.count,
   });
 });

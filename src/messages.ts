@@ -1,8 +1,8 @@
 import { ulid } from "ulid";
 import { getDb } from "./store.js";
 import { getIdentity, type IdentityInfo } from "./identity.js";
-import { ageEncrypt, ageDecrypt, signEnvelope, verifyEnvelope, generateNonce } from "./crypto.js";
-import { getContactByPubkey, touchContact, updateContactEndpoint, updateContactInfo, resolveDisplayName } from "./contacts.js";
+import { ageEncrypt, ageEncryptToSshKey, ed25519ToSshPubkey, ageDecrypt, signEnvelope, verifyEnvelope, generateNonce } from "./crypto.js";
+import { getContactByPubkey, touchContact, updateContactEndpoint, updateContactInfo, resolveDisplayName, syncAttestationsFromEnvelope } from "./contacts.js";
 import { addToInbox } from "./quarantine.js";
 import { TrustLevel, type MessageEnvelope, type MessagePayload, type StoredMessage } from "./types.js";
 
@@ -20,7 +20,8 @@ export async function sendMessage(opts: {
 
   const contact = getContactByPubkey(opts.to);
   if (!contact) throw new Error("Contact not found");
-  if (!contact.age_public_key) throw new Error("Contact missing age public key");
+  // age_public_key is optional — if missing, we derive encryption from the ed25519 key
+  const hasAgeKey = !!contact.age_public_key;
 
   const id = ulid();
   const timestamp = new Date().toISOString();
@@ -33,9 +34,16 @@ export async function sendMessage(opts: {
     metadata: opts.metadata,
   };
 
-  // Encrypt
+  // Encrypt — prefer age key, fall back to SSH ed25519 key
   const payloadJson = JSON.stringify(payload);
-  const encryptedPayload = ageEncrypt(payloadJson, contact.age_public_key);
+  let encryptedPayload: string;
+  if (hasAgeKey) {
+    encryptedPayload = ageEncrypt(payloadJson, contact.age_public_key!);
+  } else {
+    // Derive SSH public key from ed25519 key and encrypt with age -R
+    const sshPubkey = ed25519ToSshPubkey(contact.public_key);
+    encryptedPayload = ageEncryptToSshKey(payloadJson, sshPubkey);
+  }
 
   // Sign
   const signature = signEnvelope(
@@ -180,6 +188,11 @@ export function receiveMessage(envelope: MessageEnvelope): {
       agePublicKey: (envelope as any).sender_age_key,
     });
 
+    // Sync attestation URLs from envelope
+    if (envelope.attestations?.length) {
+      syncAttestationsFromEnvelope(contact.id, envelope.attestations);
+    }
+
     // If contact still missing age_public_key or endpoint, try identity discovery
     const refreshed = getContactByPubkey(fromKey);
     if (refreshed && (!refreshed.age_public_key || refreshed.endpoint === "unknown") && refreshed.endpoint && refreshed.endpoint !== "unknown") {
@@ -257,6 +270,18 @@ function quarantineMessage(envelope: MessageEnvelope, fromKey: string): void {
       `INSERT OR IGNORE INTO contacts (id, public_key, display_name, endpoint, trust_level, age_public_key)
        VALUES (?, ?, ?, ?, 0, ?)`
     ).run(contactId, fromKey, senderName, senderEndpoint, senderAgeKey);
+
+    // Also create contact_keys entry
+    const keyId = ulid();
+    db.prepare(
+      `INSERT OR IGNORE INTO contact_keys (id, contact_id, public_key, key_type, age_public_key)
+       VALUES (?, ?, ?, 'ed25519', ?)`
+    ).run(keyId, contactId, fromKey, senderAgeKey);
+
+    // Sync attestations from envelope
+    if (envelope.attestations?.length) {
+      syncAttestationsFromEnvelope(contactId, envelope.attestations);
+    }
   } else {
     // Update existing contact with any new info from envelope
     updateContactInfo(fromKey, {
@@ -264,6 +289,10 @@ function quarantineMessage(envelope: MessageEnvelope, fromKey: string): void {
       endpoint: envelope.sender_endpoint,
       agePublicKey: envelope.sender_age_key,
     });
+    // Sync attestations
+    if (envelope.attestations?.length) {
+      syncAttestationsFromEnvelope(contact.id, envelope.attestations);
+    }
   }
 }
 

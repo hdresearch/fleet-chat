@@ -124,3 +124,48 @@ export function ageDecrypt(ciphertextBase64: string, ageSecretKey: string): stri
 export function generateNonce(): string {
   return randomBytes(24).toString("base64");
 }
+
+/**
+ * Convert an Ed25519 public key (base64) to SSH authorized_keys format.
+ * This can be used with `age -R` to encrypt to an SSH ed25519 key.
+ */
+export function ed25519ToSshPubkey(pubkeyBase64: string): string {
+  const keyBytes = Buffer.from(pubkeyBase64, "base64");
+  if (keyBytes.length !== 32) {
+    throw new Error(`Expected 32-byte Ed25519 key, got ${keyBytes.length}`);
+  }
+
+  // SSH wire format: string "ssh-ed25519" + 32-byte key
+  const keyType = Buffer.from("ssh-ed25519");
+  const typeLen = Buffer.alloc(4);
+  typeLen.writeUInt32BE(keyType.length, 0);
+  const keyLen = Buffer.alloc(4);
+  keyLen.writeUInt32BE(keyBytes.length, 0);
+
+  const wireFormat = Buffer.concat([typeLen, keyType, keyLen, keyBytes]);
+  return `ssh-ed25519 ${wireFormat.toString("base64")}`;
+}
+
+/**
+ * Encrypt to an SSH ed25519 public key using age -R.
+ * Used when a contact has an ed25519 key but no explicit age public key.
+ */
+export function ageEncryptToSshKey(plaintext: string, sshPubkeyLine: string): string {
+  const tmpIn = join(tmpdir(), `fc-enc-${randomBytes(8).toString("hex")}`);
+  const tmpOut = tmpIn + ".age";
+  const tmpRecipients = tmpIn + ".pub";
+
+  try {
+    writeFileSync(tmpIn, plaintext, "utf-8");
+    writeFileSync(tmpRecipients, sshPubkeyLine + "\n", "utf-8");
+    execSync(`age -R "${tmpRecipients}" -o "${tmpOut}" "${tmpIn}"`, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const ciphertext = readFileSync(tmpOut);
+    return ciphertext.toString("base64");
+  } finally {
+    try { unlinkSync(tmpIn); } catch {}
+    try { unlinkSync(tmpOut); } catch {}
+    try { unlinkSync(tmpRecipients); } catch {}
+  }
+}

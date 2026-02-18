@@ -15,10 +15,10 @@ CREATE TABLE IF NOT EXISTS identity (
   rotated_from BLOB
 );
 
--- Contacts
+-- Contacts (public_key kept for backward compat but canonical lookup is via contact_keys)
 CREATE TABLE IF NOT EXISTS contacts (
   id TEXT PRIMARY KEY,
-  public_key TEXT NOT NULL UNIQUE,
+  public_key TEXT UNIQUE,
   display_name TEXT,
   endpoint TEXT NOT NULL,
   trust_level INTEGER NOT NULL DEFAULT 0,
@@ -30,6 +30,37 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 CREATE INDEX IF NOT EXISTS idx_contacts_trust ON contacts(trust_level);
 CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(public_key);
+
+-- Contact keys: one contact can have many keys (multi-device, rotated keys)
+CREATE TABLE IF NOT EXISTS contact_keys (
+  id TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL,
+  public_key TEXT NOT NULL UNIQUE,
+  key_type TEXT NOT NULL DEFAULT 'ed25519',
+  age_public_key TEXT,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used TEXT,
+  FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_keys_pubkey ON contact_keys(public_key);
+CREATE INDEX IF NOT EXISTS idx_contact_keys_contact ON contact_keys(contact_id);
+
+-- Social attestations: URLs where a contact's public key can be verified
+CREATE TABLE IF NOT EXISTS attestations (
+  id TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  verified_at TEXT,
+  verified_by TEXT,
+  notes TEXT,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_attestations_contact ON attestations(contact_id);
+CREATE INDEX IF NOT EXISTS idx_attestations_status ON attestations(status);
 
 -- Messages (decrypted, stored after send/receive)
 CREATE TABLE IF NOT EXISTS messages (
@@ -141,6 +172,40 @@ CREATE TABLE IF NOT EXISTS key_history (
 );
 `;
 
+/**
+ * Migrate existing contacts.public_key data into contact_keys table.
+ * Idempotent — safe to run multiple times.
+ */
+function migrateContactKeys(db: Database.Database): void {
+  // Find contacts that have a public_key but no corresponding contact_keys entry
+  const rows = db.prepare(`
+    SELECT c.id, c.public_key, c.age_public_key, c.added_at
+    FROM contacts c
+    WHERE c.public_key IS NOT NULL
+      AND c.public_key != ''
+      AND NOT EXISTS (
+        SELECT 1 FROM contact_keys ck WHERE ck.contact_id = c.id AND ck.public_key = c.public_key
+      )
+  `).all() as { id: string; public_key: string; age_public_key: string | null; added_at: string }[];
+
+  if (rows.length === 0) return;
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO contact_keys (id, contact_id, public_key, key_type, age_public_key, added_at)
+    VALUES (?, ?, ?, 'ed25519', ?, ?)
+  `);
+
+  for (const row of rows) {
+    // Generate a deterministic ID from contact_id + pubkey to ensure idempotency
+    const keyId = `migrated-${row.id}`;
+    insert.run(keyId, row.id, row.public_key, row.age_public_key, row.added_at);
+  }
+
+  if (rows.length > 0) {
+    console.log(`[fleet-chat] Migrated ${rows.length} contact keys to contact_keys table`);
+  }
+}
+
 let db: Database.Database | null = null;
 
 export function getDb(): Database.Database {
@@ -150,6 +215,7 @@ export function getDb(): Database.Database {
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     db.exec(SCHEMA);
+    migrateContactKeys(db);
   }
   return db;
 }
@@ -167,5 +233,6 @@ export function initTestDb(): Database.Database {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  // No migration needed for fresh test DBs
   return db;
 }

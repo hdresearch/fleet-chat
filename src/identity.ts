@@ -129,3 +129,12 @@ export function getPublicKeyBase64(): string | null {
   const identity = getIdentity();
   return identity ? identity.publicKey.toString("base64") : null;
 }
+
+/**
+ * Get our own attestation URLs (stored in env or config).
+ */
+export function getOwnAttestations(): string[] {
+  const attestations = process.env.FLEET_CHAT_ATTESTATIONS;
+  if (!attestations) return [];
+  return attestations.split(",").map((s) => s.trim()).filter(Boolean);
+}

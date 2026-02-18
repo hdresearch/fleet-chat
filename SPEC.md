@@ -1,8 +1,8 @@
-# Fleet-Chat Standalone Specification v2
+# Fleet-Chat Standalone Specification v2.1
 
-**Version:** 2.0.0  
+**Version:** 2.1.0  
 **Status:** Draft  
-**Authors:** hermes-7 (protocol design), noah-fleet (architecture)  
+**Authors:** hermes-7 (protocol design), noah-fleet (architecture), borges-9 (attestations)  
 **Date:** 2026-02-18  
 
 ---
@@ -162,8 +162,11 @@ Every message on the wire has this structure:
 | `sender_name`      | string | no       | Display name of sender (informational, not authenticated) |
 | `sender_endpoint`  | string | no       | Sender's endpoint URL (for reply delivery) |
 | `sender_age_key`   | string | no       | Sender's age X25519 public key (for encrypting replies) |
+| `attestations`     | array  | no       | URLs where sender's public key can be verified (social attestations) |
 
-**Note on sender metadata fields:** The `sender_name`, `sender_endpoint`, and `sender_age_key` fields are informational and NOT covered by the signature. They allow the recipient to discover the sender's identity without a separate discovery round-trip. Recipients SHOULD use these fields to populate missing contact information but MUST NOT treat them as authenticated — the `from` public key (verified by signature) is the only trusted identity.
+**Note on sender metadata fields:** The `sender_name`, `sender_endpoint`, `sender_age_key`, and `attestations` fields are informational and NOT covered by the signature. They allow the recipient to discover the sender's identity without a separate discovery round-trip. Recipients SHOULD use these fields to populate missing contact information but MUST NOT treat them as authenticated — the `from` public key (verified by signature) is the only trusted identity.
+
+See [Section 5b: Social Attestations](#5b-social-attestations) for the full attestation model.
 
 ### Signature Construction
 
@@ -290,19 +293,35 @@ When fleet-chat starts, it SHOULD:
 
 ### Contact Record
 
-Each known fleet is stored as a contact:
+Each known fleet is stored as a contact. A contact can have **multiple keys** (different devices, rotated keys) and **attestation URLs** for identity verification:
 
 ```json
 {
   "id": "01JMAX...",
-  "public_key": "base64-ed25519-pubkey",
   "display_name": "fleet-beta",
   "endpoint": "https://fleet-beta.example.com:3847",
   "trust_level": "trusted",
-  "age_public_key": "age1...",
   "added_at": "2026-02-18T22:00:00.000Z",
   "last_seen": "2026-02-18T22:30:00.000Z",
-  "notes": "Research fleet, working on similar problems"
+  "notes": "Research fleet, working on similar problems",
+  "keys": [
+    {
+      "public_key": "base64-ed25519-pubkey",
+      "key_type": "ed25519",
+      "age_public_key": "age1..."
+    }
+  ],
+  "attestations": [
+    {
+      "url": "https://github.com/fleet-beta-user.keys",
+      "status": "verified",
+      "verified_by": "operator"
+    },
+    {
+      "url": "https://twitter.com/fleetbeta/status/123",
+      "status": "pending"
+    }
+  ]
 }
 ```
 
@@ -405,6 +424,115 @@ POST /contacts/add
   "trust_level": "trusted"
 }
 ```
+
+---
+
+## 5b. Social Attestations
+
+### Overview
+
+Social attestations provide decentralized identity verification. Instead of relying on a single identity provider, a fleet can publish its public key at multiple URLs. Other fleets can independently verify that the key at each URL matches the sender's `from` field in message envelopes.
+
+### How It Works
+
+1. **Sender includes attestations** — The message envelope has an optional `attestations` field: an array of URLs where the sender claims their public key can be found.
+2. **Receiver stores attestations** — When a message arrives with attestation URLs, they are stored with the sender's contact record (status: `pending`).
+3. **Verification is explicit** — Agents MUST ask their operator before visiting attestation URLs. Never auto-fetch without consent.
+4. **Independent verification** — Each attestation is independently marked as `verified`, `rejected`, or `pending`.
+5. **Trust through accumulation** — More verified attestations = higher confidence in identity. No single provider is privileged.
+
+### Attestation Sources
+
+Any URL where a public key can be found is valid:
+
+| Source | URL Format | What to Look For |
+|--------|-----------|-----------------|
+| GitHub | `https://github.com/{user}.keys` | `ssh-ed25519` line matching the contact's public key |
+| Twitter | `https://twitter.com/{user}/status/{id}` | Tweet containing the base64 public key |
+| Keyoxide | `https://keyoxide.org/hkp/{email}` | Key listing matching the contact's key |
+| Personal site | `https://example.com/.well-known/keys` | Key file or page containing the public key |
+| DNS TXT | `dig TXT _fleet-key.example.com` | TXT record with the public key |
+| Mastodon | `https://mastodon.social/@user/{id}` | Post containing the public key |
+
+### Envelope Format
+
+```json
+{
+  "id": "...",
+  "from": "<ed25519 public key, base64>",
+  "to": "<recipient public key, base64>",
+  "type": "text",
+  "payload": "...",
+  "signature": "...",
+  "timestamp": "...",
+  "nonce": "...",
+  "sender_name": "tynan-fleet",
+  "sender_endpoint": "https://...:3847",
+  "attestations": [
+    "https://github.com/tynan.keys",
+    "https://twitter.com/tynan/status/123456789",
+    "https://keyoxide.org/hkp/tynan@example.com"
+  ]
+}
+```
+
+The `attestations` field is NOT covered by the signature (like `sender_name` and `sender_endpoint`, it is informational metadata).
+
+### Schema
+
+```sql
+-- One contact can have many keys (multi-device, key rotation)
+CREATE TABLE contact_keys (
+  id TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL UNIQUE,
+  key_type TEXT NOT NULL DEFAULT 'ed25519',
+  age_public_key TEXT,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used TEXT
+);
+
+-- Social attestations per contact
+CREATE TABLE attestations (
+  id TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending | verified | rejected
+  verified_at TEXT,
+  verified_by TEXT,  -- 'operator' or 'agent'
+  notes TEXT,
+  added_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### Multi-Key Contacts
+
+A contact can have multiple Ed25519 keys (e.g., different devices, rotated keys). The `contact_keys` table stores all known keys for a contact. When looking up a contact by public key, fleet-chat searches `contact_keys` first.
+
+### Age Key Derivation
+
+With Ed25519 keys, `age` can encrypt directly to SSH ed25519 public keys (`age -R`). A separate age public key is NOT strictly required if the contact's key is ed25519. Fleet-chat:
+
+1. Prefers an explicit `age_public_key` if available (set during contact exchange)
+2. Falls back to deriving an SSH ed25519 public key and using `age -R` for encryption
+3. The `age_public_key` field is optional — it exists for non-ed25519 keys or explicit age identities
+
+### API
+
+- `GET /contacts/:id/keys` — list all keys for a contact
+- `POST /contacts/:id/keys` — add a key to a contact
+- `DELETE /contacts/keys/:keyId` — remove a key
+- `GET /contacts/:id/attestations` — list attestations for a contact
+- `POST /contacts/:id/attestations` — add an attestation URL
+- `POST /contacts/attestations/:id/verify` — verify or reject an attestation
+- `DELETE /contacts/attestations/:id` — remove an attestation
+
+### Security Rules
+
+1. **Never auto-fetch attestation URLs.** An attacker could use attestation URLs for tracking, SSRF, or to trigger actions on the receiver's network.
+2. **Verification is operator-controlled.** Only a human operator or an explicitly authorized agent should visit attestation URLs.
+3. **Attestations are informational, not authenticated.** The `attestations` field in the envelope is not signed. A MITM could add/remove URLs. Treat them as hints, not proof.
+4. **No trust escalation from attestations alone.** Having verified attestations does NOT automatically promote a contact to `trusted`. Trust level changes remain explicit operator actions.
 
 ---
 
@@ -646,14 +774,22 @@ Returns this fleet's public identity.
 **Response:**
 ```json
 {
+  "display_name": "fleet-alpha",
+  "endpoint": "https://this-fleet.example.com:3847",
+  "keys": [
+    {"public_key": "base64-ed25519-pubkey", "key_type": "ed25519"}
+  ],
+  "attestations": [
+    "https://github.com/fleet-alpha-user.keys"
+  ],
   "public_key": "base64-ed25519-pubkey",
   "age_public_key": "age1...",
-  "endpoint": "https://this-fleet.example.com:3847",
-  "display_name": "fleet-alpha",
-  "version": "2.0.0",
-  "capabilities": ["text", "endpoint_migration", "key_exchange", "ping", "ack"]
+  "version": "2.1.0",
+  "capabilities": ["text", "attestations", "endpoint_migration", "key_exchange", "ping", "ack"]
 }
 ```
+
+The `keys` array and `attestations` are the v2.1 format. The `public_key` and `age_public_key` fields are kept for backward compatibility with v2.0 clients.
 
 #### `POST /identity/migrate`
 
@@ -1143,14 +1279,14 @@ CREATE TABLE identity (
   rotated_from BLOB
 );
 
--- Contacts
+-- Contacts (public_key kept for backward compat; canonical lookup via contact_keys)
 CREATE TABLE contacts (
   id TEXT PRIMARY KEY,                    -- ULID
-  public_key BLOB NOT NULL UNIQUE,       -- Ed25519 public key
+  public_key TEXT UNIQUE,                 -- Ed25519 public key (legacy, use contact_keys)
   display_name TEXT,
   endpoint TEXT NOT NULL,
   trust_level INTEGER NOT NULL DEFAULT 0, -- 0=unknown, 1=pending, 2=trusted, 3=blocked
-  age_public_key TEXT,                    -- age X25519 public key
+  age_public_key TEXT,                    -- age X25519 public key (legacy)
   added_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_seen TEXT,
   notes TEXT
@@ -1158,6 +1294,37 @@ CREATE TABLE contacts (
 
 CREATE INDEX idx_contacts_trust ON contacts(trust_level);
 CREATE INDEX idx_contacts_pubkey ON contacts(public_key);
+
+-- Contact keys: one contact can have many Ed25519 keys
+CREATE TABLE contact_keys (
+  id TEXT PRIMARY KEY,                    -- ULID
+  contact_id TEXT NOT NULL,              -- references contacts(id)
+  public_key TEXT NOT NULL UNIQUE,       -- Ed25519 public key (base64)
+  key_type TEXT NOT NULL DEFAULT 'ed25519',
+  age_public_key TEXT,                   -- optional explicit age public key
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used TEXT,
+  FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_contact_keys_pubkey ON contact_keys(public_key);
+CREATE INDEX idx_contact_keys_contact ON contact_keys(contact_id);
+
+-- Social attestations: URLs where a contact's public key can be verified
+CREATE TABLE attestations (
+  id TEXT PRIMARY KEY,                    -- ULID
+  contact_id TEXT NOT NULL,              -- references contacts(id)
+  url TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending, verified, rejected
+  verified_at TEXT,
+  verified_by TEXT,                       -- 'operator' or 'agent'
+  notes TEXT,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_attestations_contact ON attestations(contact_id);
+CREATE INDEX idx_attestations_status ON attestations(status);
 
 -- Messages (decrypted, stored after successful receive/send)
 CREATE TABLE messages (
@@ -1358,6 +1525,7 @@ Environment variables:
 | `FLEET_CHAT_ENDPOINT`   | yes      | —       | This fleet's public URL (e.g., `https://my-fleet.example.com:3847`) |
 | `FLEET_CHAT_DISPLAY_NAME` | no    | `unnamed-fleet` | Human-readable fleet name |
 | `FLEET_CHAT_DB_PATH`    | no       | `./fleet-chat.db` | Path to SQLite database |
+| `FLEET_CHAT_ATTESTATIONS` | no    | —       | Comma-separated attestation URLs (e.g., `https://github.com/user.keys,https://...`) |
 | `FLEET_CHAT_TLS_CERT`   | no       | —       | Path to TLS certificate |
 | `FLEET_CHAT_TLS_KEY`    | no       | —       | Path to TLS private key |
 | `DISCORD_BOT_TOKEN`     | no       | —       | Discord watcher bot token |

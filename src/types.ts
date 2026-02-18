@@ -45,6 +45,8 @@ export interface MessageEnvelope {
   sender_name?: string; // display name of sender
   sender_endpoint?: string; // sender's endpoint URL
   sender_age_key?: string; // sender's age public key (for reply encryption)
+  // Social attestations — URLs where sender's public key can be verified
+  attestations?: string[];
 }
 
 // Decrypted payload
@@ -68,10 +70,10 @@ export interface StoredMessage {
   created_at: string;
 }
 
-// Contact
+// Contact — the joined view callers see
 export interface Contact {
   id: string;
-  public_key: string; // base64
+  public_key: string; // base64 — primary key (from contact_keys)
   display_name: string | null;
   endpoint: string;
   trust_level: TrustLevelValue;
@@ -79,6 +81,29 @@ export interface Contact {
   added_at: string;
   last_seen: string | null;
   notes: string | null;
+}
+
+// Contact key — one contact can have many keys
+export interface ContactKey {
+  id: string;
+  contact_id: string;
+  public_key: string; // base64 ed25519
+  key_type: string; // 'ed25519'
+  age_public_key: string | null; // optional explicit age key
+  added_at: string;
+  last_used: string | null;
+}
+
+// Social attestation — URL where a contact's public key can be verified
+export interface Attestation {
+  id: string;
+  contact_id: string;
+  url: string;
+  status: "pending" | "verified" | "rejected";
+  verified_at: string | null;
+  verified_by: string | null; // 'operator' or 'agent'
+  notes: string | null;
+  added_at: string;
 }
 
 // Quarantine item
