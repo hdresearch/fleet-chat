@@ -2,7 +2,7 @@ import { ulid } from "ulid";
 import { getDb } from "./store.js";
 import { getIdentity } from "./identity.js";
 import { ageDecrypt } from "./crypto.js";
-import { getContactByPubkey, setTrustLevel } from "./contacts.js";
+import { getContactByPubkey, setTrustLevel, resolveDisplayName } from "./contacts.js";
 import type { QuarantineItem, InboxItem, MessagePayload } from "./types.js";
 
 /**

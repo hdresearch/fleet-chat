@@ -41,6 +41,10 @@ export interface MessageEnvelope {
   signature: string; // Ed25519 signature, base64
   timestamp: string; // ISO 8601
   nonce: string; // random bytes, base64
+  // Sender identity metadata (informational, not authenticated)
+  sender_name?: string; // display name of sender
+  sender_endpoint?: string; // sender's endpoint URL
+  sender_age_key?: string; // sender's age public key (for reply encryption)
 }
 
 // Decrypted payload

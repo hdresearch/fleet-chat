@@ -175,3 +175,62 @@ export function getTrustLevel(publicKey: string): TrustLevelValue | null {
   const contact = getContactByPubkey(publicKey);
   return contact ? contact.trust_level : null;
 }
+
+/**
+ * Update a contact's info if fields are missing or set to placeholder values.
+ * Only updates fields that are currently null/empty/"unknown".
+ * Returns true if any field was updated.
+ */
+export function updateContactInfo(publicKey: string, opts: {
+  displayName?: string;
+  endpoint?: string;
+  agePublicKey?: string;
+}): boolean {
+  const db = getDb();
+  const contact = getContactByPubkey(publicKey);
+  if (!contact) return false;
+
+  const updates: string[] = [];
+  const params: any[] = [];
+
+  if (opts.displayName && (!contact.display_name || contact.display_name === "")) {
+    updates.push("display_name = ?");
+    params.push(opts.displayName);
+  }
+
+  if (opts.endpoint && (!contact.endpoint || contact.endpoint === "unknown")) {
+    updates.push("endpoint = ?");
+    params.push(opts.endpoint);
+  }
+
+  if (opts.agePublicKey && !contact.age_public_key) {
+    updates.push("age_public_key = ?");
+    params.push(opts.agePublicKey);
+  }
+
+  if (updates.length === 0) return false;
+
+  params.push(publicKey);
+  db.prepare(`UPDATE contacts SET ${updates.join(", ")} WHERE public_key = ?`).run(...params);
+  return true;
+}
+
+/**
+ * Truncate a public key for human display.
+ * "hAQe6hLEFTOG7E1sb/Cyut5prBqKEHn2/dbDgwIdcPc=" → "hAQe6h...dcPc"
+ */
+export function truncateKey(key: string): string {
+  if (key.length <= 12) return key;
+  // Remove trailing = for cleaner display
+  const stripped = key.replace(/=+$/, "");
+  return `${stripped.slice(0, 6)}...${stripped.slice(-4)}`;
+}
+
+/**
+ * Get display name for a public key, falling back to truncated key.
+ */
+export function resolveDisplayName(publicKey: string): string {
+  const contact = getContactByPubkey(publicKey);
+  if (contact?.display_name) return contact.display_name;
+  return truncateKey(publicKey);
+}

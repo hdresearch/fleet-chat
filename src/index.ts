@@ -26,6 +26,7 @@ import {
 } from "./quarantine.js";
 import { migrateEndpoint } from "./migration.js";
 import { TrustLevelName, TrustLevelFromName } from "./types.js";
+import { truncateKey, resolveDisplayName } from "./contacts.js";
 
 const app = new Hono();
 
@@ -38,7 +39,7 @@ function requireAuth(c: any, next: () => Promise<void>) {
   if (
     path === "/identity" && c.req.method === "GET" ||
     path === "/messages/receive" && c.req.method === "POST" ||
-    path === "/contacts/add-link" && c.req.method === "GET" ||
+    path === "/contacts/add-link" && (c.req.method === "GET" || c.req.method === "POST") ||
     path === "/health"
   ) {
     return next();
@@ -197,6 +198,7 @@ app.get("/contacts", (c) => {
     contacts: contacts.map((ct) => ({
       ...ct,
       trust_level: TrustLevelName[ct.trust_level] || "unknown",
+      display_name: ct.display_name || truncateKey(ct.public_key),
     })),
     count: contacts.length,
   });
@@ -271,16 +273,22 @@ app.get("/contacts/add-link", (c) => {
 
   if (!token) return c.json({ error: "Token required" }, 400);
 
-  const valid = consumeAddLinkToken(token, pubkey);
-  if (!valid) return c.json({ error: "Invalid or expired token" }, 400);
+  // Don't consume the token on GET — just validate it, show our identity
+  // Token is consumed on POST (the actual exchange)
+  const db = getDb();
+  const tokenRow = db.prepare(
+    "SELECT * FROM add_link_tokens WHERE token = ? AND used = 0 AND expires_at > datetime('now')"
+  ).get(token) as any;
+  if (!tokenRow) return c.json({ error: "Invalid or expired token" }, 400);
 
   const identity = getIdentity();
   if (!identity) return c.json({ error: "Identity not initialized" }, 500);
 
-  // If the visitor provided their info, add as pending contact
+  // If the visitor provided their info via query params (legacy), add as pending contact
   const visitorPubkey = c.req.query("visitor_pubkey");
   const visitorEndpoint = c.req.query("visitor_endpoint");
   const visitorName = c.req.query("visitor_name");
+  const visitorAgeKey = c.req.query("visitor_age_key");
 
   if (visitorPubkey && visitorEndpoint) {
     try {
@@ -289,10 +297,13 @@ app.get("/contacts/add-link", (c) => {
         endpoint: visitorEndpoint,
         displayName: visitorName || undefined,
         trustLevel: "pending",
+        agePublicKey: visitorAgeKey || undefined,
       });
     } catch {
       // Already exists, that's fine
     }
+    // Consume token on successful exchange
+    consumeAddLinkToken(token, visitorPubkey);
   }
 
   return c.json({
@@ -300,6 +311,55 @@ app.get("/contacts/add-link", (c) => {
     endpoint: identity.endpoint,
     display_name: identity.displayName,
     age_public_key: identity.agePublicKey,
+    // Tell the visitor to POST back their identity for mutual exchange
+    exchange_url: `${identity.endpoint}/contacts/add-link`,
+  });
+});
+
+// POST /contacts/add-link — bidirectional identity exchange
+// The visitor POSTs their identity to complete the mutual add
+app.post("/contacts/add-link", async (c) => {
+  const body = await c.req.json();
+  const token = body.token || c.req.query("token");
+
+  if (!token) return c.json({ error: "Token required" }, 400);
+
+  const valid = consumeAddLinkToken(token, body.public_key);
+  if (!valid) return c.json({ error: "Invalid or expired token" }, 400);
+
+  if (!body.public_key || !body.endpoint) {
+    return c.json({ error: "public_key and endpoint required" }, 400);
+  }
+
+  const identity = getIdentity();
+  if (!identity) return c.json({ error: "Identity not initialized" }, 500);
+
+  // Add the visitor as a pending contact with full info
+  try {
+    addContact({
+      publicKey: body.public_key,
+      endpoint: body.endpoint,
+      displayName: body.display_name || undefined,
+      trustLevel: "pending",
+      agePublicKey: body.age_public_key || undefined,
+    });
+  } catch {
+    // Already exists — update their info if we have better data
+    const { updateContactInfo } = await import("./contacts.js");
+    updateContactInfo(body.public_key, {
+      displayName: body.display_name,
+      endpoint: body.endpoint,
+      agePublicKey: body.age_public_key,
+    });
+  }
+
+  // Return our full identity so both sides have complete records
+  return c.json({
+    public_key: identity.publicKey.toString("base64"),
+    endpoint: identity.endpoint,
+    display_name: identity.displayName,
+    age_public_key: identity.agePublicKey,
+    added: true,
   });
 });
 
@@ -316,7 +376,7 @@ app.get("/quarantine", (c) => {
       id: item.id,
       message_id: item.message_id,
       from_key: item.from_key,
-      from_name: null,
+      from_name: resolveDisplayName(item.from_key),
       received_at: item.received_at,
       type: item.type,
       status: item.status,

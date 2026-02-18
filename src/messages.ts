@@ -2,7 +2,7 @@ import { ulid } from "ulid";
 import { getDb } from "./store.js";
 import { getIdentity, type IdentityInfo } from "./identity.js";
 import { ageEncrypt, ageDecrypt, signEnvelope, verifyEnvelope, generateNonce } from "./crypto.js";
-import { getContactByPubkey, touchContact, updateContactEndpoint } from "./contacts.js";
+import { getContactByPubkey, touchContact, updateContactEndpoint, updateContactInfo, resolveDisplayName } from "./contacts.js";
 import { addToInbox } from "./quarantine.js";
 import { TrustLevel, type MessageEnvelope, type MessagePayload, type StoredMessage } from "./types.js";
 
@@ -54,6 +54,9 @@ export async function sendMessage(opts: {
     signature,
     timestamp,
     nonce,
+    sender_name: identity.displayName,
+    sender_endpoint: identity.endpoint,
+    sender_age_key: identity.agePublicKey,
   };
 
   // Store locally
@@ -169,6 +172,22 @@ export function receiveMessage(envelope: MessageEnvelope): {
   const contact = getContactByPubkey(fromKey);
   const trustLevel = contact?.trust_level ?? null;
 
+  // Update contact info from envelope metadata (sender_name, sender_endpoint, sender_age_key)
+  if (contact) {
+    updateContactInfo(fromKey, {
+      displayName: (envelope as any).sender_name,
+      endpoint: (envelope as any).sender_endpoint,
+      agePublicKey: (envelope as any).sender_age_key,
+    });
+
+    // If contact still missing age_public_key or endpoint, try identity discovery
+    const refreshed = getContactByPubkey(fromKey);
+    if (refreshed && (!refreshed.age_public_key || refreshed.endpoint === "unknown") && refreshed.endpoint && refreshed.endpoint !== "unknown") {
+      // Fire-and-forget identity discovery
+      discoverIdentity(refreshed.endpoint, fromKey).catch(() => {});
+    }
+  }
+
   // Blocked → silently drop
   if (trustLevel === TrustLevel.BLOCKED) {
     return { received: true, id: envelope.id };
@@ -227,14 +246,57 @@ function quarantineMessage(envelope: MessageEnvelope, fromKey: string): void {
      VALUES (?, ?, ?, ?, ?, 'pending')`
   ).run(id, envelope.id, fromKey, JSON.stringify(envelope), envelope.type);
 
-  // Auto-create unknown contact if needed
+  // Auto-create unknown contact if needed, using sender metadata from envelope
   const contact = getContactByPubkey(fromKey);
   if (!contact) {
     const contactId = ulid();
+    const senderEndpoint = envelope.sender_endpoint || "unknown";
+    const senderName = envelope.sender_name || null;
+    const senderAgeKey = envelope.sender_age_key || null;
     db.prepare(
-      `INSERT OR IGNORE INTO contacts (id, public_key, endpoint, trust_level)
-       VALUES (?, ?, ?, 0)`
-    ).run(contactId, fromKey, "unknown");
+      `INSERT OR IGNORE INTO contacts (id, public_key, display_name, endpoint, trust_level, age_public_key)
+       VALUES (?, ?, ?, ?, 0, ?)`
+    ).run(contactId, fromKey, senderName, senderEndpoint, senderAgeKey);
+  } else {
+    // Update existing contact with any new info from envelope
+    updateContactInfo(fromKey, {
+      displayName: envelope.sender_name,
+      endpoint: envelope.sender_endpoint,
+      agePublicKey: envelope.sender_age_key,
+    });
+  }
+}
+
+/**
+ * Discover a sender's identity by calling GET <endpoint>/identity.
+ * Updates the contact record with discovered info.
+ */
+async function discoverIdentity(endpoint: string, publicKey: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`${endpoint}/identity`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return false;
+
+    const data = await resp.json() as {
+      public_key?: string;
+      age_public_key?: string;
+      endpoint?: string;
+      display_name?: string;
+    };
+
+    // Verify the identity matches the expected public key
+    if (data.public_key && data.public_key !== publicKey) return false;
+
+    updateContactInfo(publicKey, {
+      displayName: data.display_name,
+      endpoint: data.endpoint,
+      agePublicKey: data.age_public_key,
+    });
+
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -293,7 +355,14 @@ export function listMessages(opts?: {
 
   const messages = db.prepare(sql).all(...params) as StoredMessage[];
 
-  return { messages, count: messages.length, total };
+  // Resolve display names for each message
+  const messagesWithNames = messages.map((msg) => ({
+    ...msg,
+    from_name: resolveDisplayName(msg.from_key),
+    to_name: resolveDisplayName(msg.to_key),
+  }));
+
+  return { messages: messagesWithNames, count: messages.length, total };
 }
 
 /**

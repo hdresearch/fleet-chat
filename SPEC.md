@@ -149,16 +149,21 @@ Every message on the wire has this structure:
 }
 ```
 
-| Field       | Type   | Description |
-|-------------|--------|-------------|
-| `id`        | string | ULID — globally unique, lexicographically sortable |
-| `from`      | string | Sender's Ed25519 public key (base64) |
-| `to`        | string | Recipient's Ed25519 public key (base64) |
-| `type`      | string | Message type: `text`, `endpoint_migration`, `key_exchange`, `key_rotation`, `ping`, `ack` |
-| `payload`   | string | age-encrypted payload (base64-encoded ciphertext) |
-| `signature` | string | Ed25519 signature over `payload + nonce + timestamp` (base64) |
-| `timestamp` | string | ISO 8601 timestamp (UTC) |
-| `nonce`     | string | 24 random bytes (base64) — prevents replay attacks |
+| Field              | Type   | Required | Description |
+|--------------------|--------|----------|-------------|
+| `id`               | string | yes      | ULID — globally unique, lexicographically sortable |
+| `from`             | string | yes      | Sender's Ed25519 public key (base64) |
+| `to`               | string | yes      | Recipient's Ed25519 public key (base64) |
+| `type`             | string | yes      | Message type: `text`, `endpoint_migration`, `key_exchange`, `key_rotation`, `ping`, `ack` |
+| `payload`          | string | yes      | age-encrypted payload (base64-encoded ciphertext) |
+| `signature`        | string | yes      | Ed25519 signature over `payload + nonce + timestamp` (base64) |
+| `timestamp`        | string | yes      | ISO 8601 timestamp (UTC) |
+| `nonce`            | string | yes      | 24 random bytes (base64) — prevents replay attacks |
+| `sender_name`      | string | no       | Display name of sender (informational, not authenticated) |
+| `sender_endpoint`  | string | no       | Sender's endpoint URL (for reply delivery) |
+| `sender_age_key`   | string | no       | Sender's age X25519 public key (for encrypting replies) |
+
+**Note on sender metadata fields:** The `sender_name`, `sender_endpoint`, and `sender_age_key` fields are informational and NOT covered by the signature. They allow the recipient to discover the sender's identity without a separate discovery round-trip. Recipients SHOULD use these fields to populate missing contact information but MUST NOT treat them as authenticated — the `from` public key (verified by signature) is the only trusted identity.
 
 ### Signature Construction
 
@@ -318,9 +323,22 @@ Fleet-alpha can trust fleet-beta (trust_level = `trusted`) while fleet-beta stil
 - There is no "mutual trust handshake" requirement
 - A fleet can receive messages from a trusted contact even if that contact hasn't yet trusted them back (the messages will land in the other fleet's quarantine)
 
+### Auto-Discovery from Message Envelope
+
+When receiving a message, fleet-chat automatically extracts sender identity metadata from the envelope's optional fields (`sender_name`, `sender_endpoint`, `sender_age_key`):
+
+1. If the sender's contact record has no `display_name`, populate it from `sender_name`
+2. If the sender's contact record has `endpoint` set to `"unknown"` or empty, populate from `sender_endpoint`
+3. If the sender's contact record has no `age_public_key`, populate from `sender_age_key`
+4. Existing values are NEVER overwritten — only missing fields are populated
+
+If the sender's endpoint is known but `age_public_key` is still missing, fleet-chat MAY attempt identity discovery by calling `GET <endpoint>/identity` to fetch the sender's full identity.
+
+This ensures that when someone connects and sends a message, the recipient can always reply — they have the sender's age key (for encryption) and endpoint (for delivery).
+
 ### Contact Discovery Methods
 
-#### 1. Single-Link Friend Add (Primary)
+#### 1. Single-Link Friend Add (Bidirectional)
 
 Generate a one-time add link:
 
@@ -332,12 +350,37 @@ https://fleet-alpha.example.com:3847/contacts/add-link?
   token=one-time-random-token
 ```
 
-When the recipient's fleet-chat visits this URL:
-1. It fetches the sender's public key and endpoint
-2. Creates a contact record at `pending` trust level
-3. Optionally sends back its own pubkey + endpoint (mutual add)
+The add-link flow is a **bidirectional identity exchange**:
 
-The token is single-use and expires after 24 hours.
+1. **Step 1 — GET the link:** The visitor's fleet-chat GETs the add-link URL. The response contains the link generator's full identity (public key, age key, endpoint, display name) and an `exchange_url`.
+
+2. **Step 2 — POST back identity:** The visitor POSTs their own identity to the `exchange_url` (same endpoint, POST method) with the token and their `public_key`, `endpoint`, `display_name`, and `age_public_key`.
+
+3. **Result:** Both sides have complete contact records with all fields needed for encrypted messaging.
+
+The token is single-use (consumed on POST, or on GET if visitor provides identity via query params) and expires after 24 hours.
+
+**POST body for identity exchange:**
+```json
+{
+  "token": "one-time-random-token",
+  "public_key": "base64-ed25519-pubkey",
+  "endpoint": "https://fleet-beta.example.com:3847",
+  "display_name": "fleet-beta",
+  "age_public_key": "age1..."
+}
+```
+
+**Response:**
+```json
+{
+  "public_key": "base64-ed25519-pubkey",
+  "endpoint": "https://fleet-alpha.example.com:3847",
+  "display_name": "fleet-alpha",
+  "age_public_key": "age1...",
+  "added": true
+}
+```
 
 #### 2. GitHub Key Discovery
 
@@ -705,8 +748,10 @@ List messages with optional filters.
   "messages": [
     {
       "id": "01JMAX...",
-      "from": "base64-pubkey",
-      "to": "base64-pubkey",
+      "from_key": "base64-pubkey",
+      "to_key": "base64-pubkey",
+      "from_name": "fleet-beta",
+      "to_name": "fleet-alpha",
       "type": "text",
       "content": "Hello from fleet-beta!",
       "metadata": {},
@@ -719,6 +764,8 @@ List messages with optional filters.
   "total": 42
 }
 ```
+
+The `from_name` and `to_name` fields resolve public keys to display names from the contact database. If no display name is known, a truncated key fingerprint is shown (e.g., `hAQe6h...dcPc`).
 
 Note: The `content` field contains the **decrypted** plaintext. Encrypted payloads are never returned by this endpoint.
 
@@ -876,9 +923,11 @@ Generate a single-use friend-add link.
 
 #### `GET /contacts/add-link` (Public)
 
-Accept a friend-add link. Returns the fleet's identity for the visiting fleet to consume.
+Accept a friend-add link. Returns the fleet's identity for the visiting fleet to consume. Does NOT consume the token (allows the visitor to inspect before committing).
 
 **Query parameters:** `pubkey`, `endpoint`, `name`, `token`
+
+Optional visitor identity params (legacy, for single-request exchange): `visitor_pubkey`, `visitor_endpoint`, `visitor_name`, `visitor_age_key`
 
 **Response:**
 ```json
@@ -886,11 +935,40 @@ Accept a friend-add link. Returns the fleet's identity for the visiting fleet to
   "public_key": "base64-ed25519-pubkey",
   "endpoint": "https://fleet-alpha.example.com:3847",
   "display_name": "fleet-alpha",
+  "age_public_key": "age1...",
+  "exchange_url": "https://fleet-alpha.example.com:3847/contacts/add-link"
+}
+```
+
+The visiting fleet's software should POST back its identity to `exchange_url` to complete the bidirectional exchange.
+
+#### `POST /contacts/add-link` (Public)
+
+Complete the bidirectional identity exchange. The visitor POSTs their full identity to the link generator's endpoint.
+
+**Request:**
+```json
+{
+  "token": "one-time-random-token",
+  "public_key": "base64-ed25519-pubkey",
+  "endpoint": "https://fleet-beta.example.com:3847",
+  "display_name": "fleet-beta",
   "age_public_key": "age1..."
 }
 ```
 
-The visiting fleet's software should automatically call `POST /contacts/add` on its own instance with this information.
+**Response:**
+```json
+{
+  "public_key": "base64-ed25519-pubkey",
+  "endpoint": "https://fleet-alpha.example.com:3847",
+  "display_name": "fleet-alpha",
+  "age_public_key": "age1...",
+  "added": true
+}
+```
+
+This consumes the token. Both sides now have complete contact records.
 
 ---
 
@@ -915,7 +993,7 @@ List quarantined messages.
       "id": "01JMAX...",
       "message_id": "01JMAX...",
       "from_key": "base64-ed25519-pubkey",
-      "from_name": null,
+      "from_name": "fleet-beta",
       "received_at": "2026-02-18T22:00:00.000Z",
       "type": "text",
       "status": "pending"
@@ -924,6 +1002,8 @@ List quarantined messages.
   "count": 1
 }
 ```
+
+The `from_name` field resolves to the sender's display name from their contact record, or a truncated key fingerprint (e.g., `hAQe6h...dcPc`) if no name is known.
 
 Note: Message content is NOT included in the list response (it's still encrypted).
 
