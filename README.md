@@ -1,6 +1,14 @@
 # fleet-chat
 
-Encrypted fleet-to-fleet messaging. Ed25519 identity, age encryption, social attestations.
+Secure, encrypted messaging between autonomous agent fleets.
+
+- **Ed25519 keypairs** for identity — not URLs. Identity survives VM migration.
+- **age encryption** for message confidentiality
+- **Ed25519 signatures** for sender authentication
+- **Social attestations** — verify identity via arbitrary URLs (GitHub keys, Twitter, personal sites)
+- **Endpoint migration** protocol for when fleets move between VMs
+- **Asymmetric trust** model with quarantine for unknown senders
+- **Multi-key contacts** — one contact, many keys (devices, rotation)
 
 ## Quick Start
 
